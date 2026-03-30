@@ -11,6 +11,8 @@ class Shop(BaseModel):
     owner_id = Column(String(36), nullable=False, index=True)
     owner_email = Column(String(255), nullable=False)
     domain = Column(String(255), nullable=True)
+    # Links this assistant shop to a thronos-commerce tenant (e.g. "eukolakis")
+    commerce_tenant_id = Column(String(100), nullable=True, index=True, unique=True)
     description = Column(Text, nullable=True)
 
     # Policies

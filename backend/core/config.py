@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     # AI
     openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
 
     # Email / SMTP
     email_enabled: bool = False
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
 
     # Thronos Blockchain
     thronos_node_url: str = "https://node1.thronoschain.org"
+
+    # Commerce → Assistant webhook shared secret
+    commerce_webhook_secret: str = ""
 
     # CORS
     cors_allow_origins: str = ""
@@ -68,5 +72,9 @@ def validate_environment():
         warnings.append("DATABASE_URL not set – using in-memory SQLite")
     if settings.jwt_secret_key == "change-me-in-production":
         warnings.append("JWT_SECRET_KEY is using default – change in production")
+    if not settings.openai_api_key:
+        warnings.append("OPENAI_API_KEY not set – assistant will use keyword fallback only")
+    if not settings.commerce_webhook_secret:
+        warnings.append("COMMERCE_WEBHOOK_SECRET not set – webhook signature validation disabled")
     for w in warnings:
         logger.warning(w)
