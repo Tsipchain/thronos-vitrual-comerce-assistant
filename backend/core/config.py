@@ -12,8 +12,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Database
-    database_url: str | None = None
+    # Database – Railway PostgreSQL plugin exposes the URL under several names;
+    # database.py checks all four in priority order.
+    database_url: str | None = None          # DATABASE_URL
+    postgres_url: str | None = None          # POSTGRES_URL  (Railway default)
+    database_private_url: str | None = None  # DATABASE_PRIVATE_URL
+    database_public_url: str | None = None   # DATABASE_PUBLIC_URL
 
     # Auth
     jwt_secret_key: str = "change-me-in-production"
@@ -67,14 +71,31 @@ def validate_environment():
     """Validate critical environment variables at startup."""
     import logging
     logger = logging.getLogger(__name__)
+
+    # Check whether *any* Railway DB URL var is set.
+    _db_url_vars = [
+        "DATABASE_URL",
+        "POSTGRES_URL",
+        "DATABASE_PRIVATE_URL",
+        "DATABASE_PUBLIC_URL",
+    ]
+    has_db = any(
+        getattr(settings, var.lower(), None) or os.environ.get(var)
+        for var in _db_url_vars
+    )
+
     warnings = []
-    if not settings.database_url:
-        warnings.append("DATABASE_URL not set – using in-memory SQLite")
+    if not has_db:
+        warnings.append(
+            "No database URL configured (checked: " + ", ".join(_db_url_vars) + ") – "
+            "using in-memory SQLite; data will not persist"
+        )
     if settings.jwt_secret_key == "change-me-in-production":
-        warnings.append("JWT_SECRET_KEY is using default – change in production")
+        warnings.append("JWT_SECRET_KEY is using the default value – change in production")
     if not settings.openai_api_key:
         warnings.append("OPENAI_API_KEY not set – assistant will use keyword fallback only")
     if not settings.commerce_webhook_secret:
         warnings.append("COMMERCE_WEBHOOK_SECRET not set – webhook signature validation disabled")
+
     for w in warnings:
         logger.warning(w)
