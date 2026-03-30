@@ -24,11 +24,34 @@ _RAILWAY_DB_ENV_VARS = [
 
 
 def _normalize_scheme(url: str) -> str:
-    """Convert postgres:// or postgresql:// to postgresql+asyncpg://."""
+    """
+    Ensure the URL uses the async driver variant required by create_async_engine.
+
+    Conversions applied:
+      postgres://...              -> postgresql+asyncpg://...
+      postgresql://...            -> postgresql+asyncpg://...
+      postgresql+psycopg2://...   -> postgresql+asyncpg://...
+      sqlite://...                -> sqlite+aiosqlite://...
+
+    Already-correct URLs (postgresql+asyncpg://, sqlite+aiosqlite://) pass through.
+    """
+    # ── PostgreSQL ──────────────────────────────────────────────────────────────
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgresql://") and "+" not in url.split("://")[0]:
+
+    if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    if url.startswith("postgresql+") and not url.startswith("postgresql+asyncpg://"):
+        # Handles postgresql+psycopg2://, postgresql+psycopg://, etc.
+        rest = url.split("://", 1)[1]
+        return f"postgresql+asyncpg://{rest}"
+
+    # ── SQLite ───────────────────────────────────────────────────────────────────
+    if url.startswith("sqlite://") and "+aiosqlite" not in url:
+        # Replace only the scheme portion; preserve the path (including leading slashes).
+        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+
     return url
 
 
@@ -39,15 +62,15 @@ def _get_db_url() -> str:
     Checks the following vars in order (first non-empty value wins):
       DATABASE_URL, POSTGRES_URL, DATABASE_PRIVATE_URL, DATABASE_PUBLIC_URL
 
-    Normalises the scheme to postgresql+asyncpg:// and pre-validates the URL
-    with SQLAlchemy's make_url() so failures are caught here with a clear
-    message rather than deep inside create_async_engine.
+    Normalises the scheme to the async driver variant and pre-validates with
+    SQLAlchemy's make_url() so failures are caught here with a clear message
+    rather than deep inside create_async_engine.
     """
     raw_url: str | None = None
     source_var: str | None = None
 
-    # settings.database_url covers DATABASE_URL via pydantic-settings;
-    # the rest we read directly from os.environ.
+    # settings.*_url fields cover the vars via pydantic-settings (.env + env vars);
+    # os.environ fallback handles any vars not declared in Settings.
     pydantic_candidates = {
         "DATABASE_URL": settings.database_url,
         "POSTGRES_URL": settings.postgres_url,
@@ -56,7 +79,6 @@ def _get_db_url() -> str:
     }
 
     for var_name in _RAILWAY_DB_ENV_VARS:
-        # Prefer the pydantic-resolved value (respects .env file), fall back to raw env.
         value = pydantic_candidates.get(var_name) or os.environ.get(var_name)
         if value and value.strip():
             raw_url = value.strip()
@@ -65,9 +87,9 @@ def _get_db_url() -> str:
 
     if not raw_url:
         logger.warning(
-            "No database URL found in any of: %s – "
+            "No database URL found in any of: %s \u2013 "
             "falling back to in-memory SQLite (data will NOT persist across restarts). "
-            "Set one of those env vars to a PostgreSQL connection string.",
+            "Set one of those env vars to a connection string.",
             ", ".join(_RAILWAY_DB_ENV_VARS),
         )
         return "sqlite+aiosqlite://"
@@ -83,8 +105,9 @@ def _get_db_url() -> str:
             f"  Raw value    : {raw_url!r}\n"
             f"  Normalised   : {normalised!r}\n"
             f"  Error        : {exc}\n"
-            "  Expected format: postgresql+asyncpg://user:password@host:port/dbname\n"
-            "  Fix: set DATABASE_URL (or POSTGRES_URL) to a valid PostgreSQL connection string."
+            "  For PostgreSQL: postgresql+asyncpg://user:password@host:port/dbname\n"
+            "  For SQLite    : sqlite+aiosqlite:////absolute/path/db.sqlite\n"
+            "  Fix: set DATABASE_URL to a valid connection string."
         ) from exc
 
     scheme = normalised.split("://")[0]
