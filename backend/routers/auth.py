@@ -49,3 +49,36 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
 
     token = create_access_token(user_id=user_id, email=request.email, shop_id=shop.id)
     return TokenResponse(access_token=token, user_id=user_id, shop_id=shop.id)
+
+
+class CustomerTokenRequest(BaseModel):
+    commerce_tenant_id: str
+    customer_id: str | None = None
+    customer_email: str | None = None
+
+
+@router.post("/customer-token", response_model=TokenResponse)
+async def customer_token(request: CustomerTokenRequest, db: AsyncSession = Depends(get_db)):
+    """Issue a scoped customer JWT for a commerce tenant's storefront widget.
+
+    The commerce app calls this with its tenant ID to get a short-lived
+    customer-scoped token. The token has role='customer' so the assistant
+    restricts responses to customer-facing information only.
+    """
+    result = await db.execute(
+        select(Shop).where(Shop.commerce_tenant_id == request.commerce_tenant_id)
+    )
+    shop = result.scalar_one_or_none()
+    if not shop:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No shop linked to commerce_tenant_id={request.commerce_tenant_id!r}",
+        )
+    customer_id = request.customer_id or str(uuid.uuid4())
+    token = create_access_token(
+        user_id=customer_id,
+        email=request.customer_email or "",
+        role="customer",
+        shop_id=shop.id,
+    )
+    return TokenResponse(access_token=token, user_id=customer_id, shop_id=shop.id)
