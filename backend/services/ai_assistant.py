@@ -2,8 +2,13 @@
 Thronos Commerce AI Assistant - The Brain
 Processes natural language queries and routes to appropriate services.
 Supports Greek and English.
+
+Intent resolution order:
+  1. ask_openai() — uses OPENAI_API_KEY if set; customer vs merchant system prompt
+  2. Keyword handler fallback via INTENT_MAP + _handle_* methods
 """
 import logging
+import os
 import re
 from typing import Optional
 
@@ -13,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.orders import Order
 from models.products import Product
 from models.returns import ReturnRequest
+from models.shop import Shop
 from services.analytics import AnalyticsService
 from services.inventory import InventoryService
 from services.returns import ReturnsService
@@ -95,11 +101,49 @@ class CommerceAssistant:
         self.vouchers = VoucherService(db)
         self.analytics = AnalyticsService(db)
 
-    async def process_message(self, shop_id: str, message: str, context: dict | None = None) -> dict:
+    async def _get_shop_context(self, shop_id: str) -> dict:
+        """Fetch minimal shop context for OpenAI system prompt."""
+        try:
+            result = await self.db.execute(select(Shop).where(Shop.id == shop_id))
+            shop = result.scalar_one_or_none()
+            if not shop:
+                return {}
+            return {
+                "shop_name": shop.name,
+                "return_window_days": shop.return_window_days,
+            }
+        except Exception:
+            return {}
+
+    async def process_message(
+        self,
+        shop_id: str,
+        message: str,
+        context: dict | None = None,
+        role: str = "customer",
+    ) -> dict:
         msg_lower = message.lower().strip()
         intent = self._detect_intent(msg_lower)
-        logger.info(f"[Assistant] shop={shop_id} intent={intent} msg={message[:80]}")
+        logger.info(f"[Assistant] shop={shop_id} role={role} intent={intent} msg={message[:80]}")
 
+        # 1. Try OpenAI first if API key is available
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key:
+            try:
+                from services.openai_brain import ask_openai
+                shop_ctx = await self._get_shop_context(shop_id)
+                result = await ask_openai(
+                    message=message,
+                    role=role,
+                    shop_context=shop_ctx,
+                    api_key=openai_key,
+                )
+                if result is not None:
+                    return result
+            except Exception as exc:
+                logger.warning(f"[Assistant] OpenAI failed, falling back to keyword handlers: {exc}")
+
+        # 2. Keyword handler fallback
         try:
             handler = getattr(self, f"_handle_{intent}", None)
             if handler:
