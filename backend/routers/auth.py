@@ -1,9 +1,10 @@
 import logging
+import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from pydantic import BaseModel
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies.database import get_db
@@ -58,13 +59,32 @@ class CustomerTokenRequest(BaseModel):
 
 
 @router.post("/customer-token", response_model=TokenResponse)
-async def customer_token(request: CustomerTokenRequest, db: AsyncSession = Depends(get_db)):
+async def customer_token(
+    request: CustomerTokenRequest,
+    db: AsyncSession = Depends(get_db),
+    x_thronos_commerce_key: str | None = Header(default=None, alias="X-Thronos-Commerce-Key"),
+):
     """Issue a scoped customer JWT for a commerce tenant's storefront widget.
 
-    The commerce app calls this with its tenant ID to get a short-lived
-    customer-scoped token. The token has role='customer' so the assistant
-    restricts responses to customer-facing information only.
+    Requires the caller to supply the shared secret via X-Thronos-Commerce-Key.
+    Set THRONOS_COMMERCE_API_KEY on this service to enable the check.
+    If the env var is absent the check is skipped with a warning (dev mode).
     """
+    expected_key = os.getenv("THRONOS_COMMERCE_API_KEY", "").strip()
+    if expected_key:
+        if not x_thronos_commerce_key or x_thronos_commerce_key != expected_key:
+            logger.warning(
+                "[auth] /customer-token rejected — invalid or missing X-Thronos-Commerce-Key"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid commerce key",
+            )
+    else:
+        logger.warning(
+            "[auth] THRONOS_COMMERCE_API_KEY not set — skipping commerce-key check (dev mode)"
+        )
+
     result = await db.execute(
         select(Shop).where(Shop.commerce_tenant_id == request.commerce_tenant_id)
     )
