@@ -24,9 +24,13 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 1440
 
-    # AI
+    # AI — OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+
+    # AI — Anthropic (Claude). Takes priority over OpenAI when set.
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-6"
 
     # Email / SMTP
     email_enabled: bool = False
@@ -91,9 +95,14 @@ def validate_environment():
             "using in-memory SQLite; data will not persist"
         )
     if settings.jwt_secret_key == "change-me-in-production":
-        warnings.append("JWT_SECRET_KEY is using the default value – change in production")
-    if not settings.openai_api_key:
-        warnings.append("OPENAI_API_KEY not set – assistant will use keyword fallback only")
+        if settings.environment == "production":
+            raise RuntimeError(
+                "FATAL: JWT_SECRET_KEY is set to the insecure default value. "
+                "Set JWT_SECRET_KEY to a strong random secret before starting in production."
+            )
+        warnings.append("JWT_SECRET_KEY is using the default value – MUST be changed before production")
+    if not settings.anthropic_api_key and not settings.openai_api_key:
+        warnings.append("Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY set – assistant will use keyword fallback only")
     if not settings.commerce_webhook_secret:
         warnings.append("COMMERCE_WEBHOOK_SECRET not set – webhook signature validation disabled")
 

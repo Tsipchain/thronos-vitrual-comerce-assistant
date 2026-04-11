@@ -1,9 +1,10 @@
 """
-OpenAI-powered brain for the Commerce Assistant.
-Called first by process_message(); keyword handlers are the fallback.
+AI brain for the Commerce Assistant.
+Priority: Claude (Anthropic) → OpenAI → keyword fallback.
+
+Callers pass API keys explicitly so config is not imported here.
 """
 import logging
-import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -23,22 +24,8 @@ If you cannot resolve the issue, suggest contacting support.
 """
 
 
-async def ask_openai(
-    message: str,
-    role: str,
-    shop_context: Optional[dict],
-    api_key: str,
-    model: str = "gpt-4o-mini",
-) -> Optional[dict]:
-    """Send message to OpenAI; return ChatResponse-compatible dict or None on failure."""
-    try:
-        from openai import AsyncOpenAI
-    except ImportError:
-        logger.debug("openai package not installed — skipping AI brain")
-        return None
-
+def _build_system(role: str, shop_context: Optional[dict]) -> str:
     system = CUSTOMER_SYSTEM if role == "customer" else MERCHANT_SYSTEM
-
     if shop_context:
         parts = []
         if shop_context.get("shop_name"):
@@ -49,7 +36,54 @@ async def ask_openai(
             parts.append(f"Return window: {shop_context['return_window_days']} days")
         if parts:
             system += "\n\nContext: " + ", ".join(parts)
+    return system
 
+
+async def ask_claude(
+    message: str,
+    role: str,
+    shop_context: Optional[dict],
+    api_key: str,
+    model: str = "claude-sonnet-4-6",
+) -> Optional[dict]:
+    """Send message to Anthropic Claude; return ChatResponse-compatible dict or None."""
+    try:
+        import anthropic
+    except ImportError:
+        logger.debug("anthropic package not installed — skipping Claude brain")
+        return None
+
+    system = _build_system(role, shop_context)
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=600,
+            system=system,
+            messages=[{"role": "user", "content": message}],
+        )
+        answer = resp.content[0].text.strip()
+        return {"response": answer, "data": None, "suggested_actions": [], "intent": "ai"}
+    except Exception as exc:
+        logger.warning(f"Claude call failed: {exc}")
+        return None
+
+
+async def ask_openai(
+    message: str,
+    role: str,
+    shop_context: Optional[dict],
+    api_key: str,
+    model: str = "gpt-4o-mini",
+) -> Optional[dict]:
+    """Send message to OpenAI; return ChatResponse-compatible dict or None."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        logger.debug("openai package not installed — skipping OpenAI brain")
+        return None
+
+    system = _build_system(role, shop_context)
     try:
         client = AsyncOpenAI(api_key=api_key)
         resp = await client.chat.completions.create(

@@ -48,6 +48,7 @@ EUKOLAKIS_SHOP = {
         "Για επιστροφές επικοινωνήστε μαζί μας στο info@eukolaki.gr."
     ),
     "return_window_days": 14,
+    "currency": "EUR",
     "shipping_methods": [
         {"id": "standard_cod", "label": "Courier με αντικαταβολή", "base": 4, "codFee": 2},
         {"id": "standard_card", "label": "Courier με κάρτα", "base": 3, "codFee": 0},
