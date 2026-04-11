@@ -15,6 +15,9 @@ class Shop(BaseModel):
     commerce_tenant_id = Column(String(100), nullable=True, index=True, unique=True)
     description = Column(Text, nullable=True)
 
+    # Currency used by this shop (ISO 4217)
+    currency = Column(String(3), nullable=False, default="EUR")
+
     # Policies
     return_policy_text = Column(Text, nullable=True)
     return_window_days = Column(Integer, default=14)

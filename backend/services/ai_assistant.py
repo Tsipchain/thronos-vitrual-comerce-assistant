@@ -102,16 +102,20 @@ class CommerceAssistant:
         self.analytics = AnalyticsService(db)
 
     async def _get_shop_context(self, shop_id: str) -> dict:
-        """Fetch minimal shop context for OpenAI system prompt."""
+        """Fetch minimal shop context for AI system prompt."""
         try:
             result = await self.db.execute(select(Shop).where(Shop.id == shop_id))
             shop = result.scalar_one_or_none()
             if not shop:
                 return {}
-            return {
+            ctx = {
                 "shop_name": shop.name,
                 "return_window_days": shop.return_window_days,
             }
+            # Include currency if the field exists on the model
+            if hasattr(shop, "currency") and shop.currency:
+                ctx["currency"] = shop.currency
+            return ctx
         except Exception:
             return {}
 
@@ -126,7 +130,26 @@ class CommerceAssistant:
         intent = self._detect_intent(msg_lower)
         logger.info(f"[Assistant] shop={shop_id} role={role} intent={intent} msg={message[:80]}")
 
-        # 1. Try OpenAI first if API key is available
+        # 1. Try Claude (Anthropic) first — highest quality
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if anthropic_key:
+            try:
+                from services.openai_brain import ask_claude
+                shop_ctx = await self._get_shop_context(shop_id)
+                anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+                result = await ask_claude(
+                    message=message,
+                    role=role,
+                    shop_context=shop_ctx,
+                    api_key=anthropic_key,
+                    model=anthropic_model,
+                )
+                if result is not None:
+                    return result
+            except Exception as exc:
+                logger.warning(f"[Assistant] Claude failed, trying OpenAI: {exc}")
+
+        # 2. Fall back to OpenAI if configured
         openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         if openai_key:
             try:
@@ -143,7 +166,7 @@ class CommerceAssistant:
             except Exception as exc:
                 logger.warning(f"[Assistant] OpenAI failed, falling back to keyword handlers: {exc}")
 
-        # 2. Keyword handler fallback
+        # 3. Keyword handler fallback
         try:
             handler = getattr(self, f"_handle_{intent}", None)
             if handler:
