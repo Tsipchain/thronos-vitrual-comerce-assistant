@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 DEFAULT_ORIGINS = [
     "https://commerce.thronoschain.org",
     "https://commerce-api.thronoschain.org",
+    "https://thronoscommerce.thronoschain.org",
+    "https://www.thronoscommerce.thronoschain.org",
     "https://eukolaki.gr",
     "https://www.eukolaki.gr",
     "http://localhost:5173",
