@@ -8,6 +8,8 @@ DEFAULT_ORIGINS = [
     "https://commerce-api.thronoschain.org",
     "https://thronoscommerce.thronoschain.org",
     "https://www.thronoscommerce.thronoschain.org",
+    "https://thonoscommerce.thronoschain.org",
+    "https://www.thonoscommerce.thronoschain.org",
     "https://eukolaki.gr",
     "https://www.eukolaki.gr",
     "http://localhost:5173",
