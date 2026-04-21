@@ -5,8 +5,7 @@ Endpoint: POST /api/v1/webhooks/commerce
 Security: HMAC-SHA256 signature in X-Thronos-Signature header.
   Format: sha256=<hex digest>
   Key:    COMMERCE_WEBHOOK_SECRET env var (both sides must share the same value)
-  If the secret is not configured, signature checking is skipped with a warning
-  (useful for local development; must be set in production).
+  If the secret is not configured, all webhook requests are rejected with 401.
 
 Supported events:
   order.placed          → upsert order + items
@@ -32,10 +31,10 @@ SUPPORTED_EVENTS = {"order.placed", "order.status_changed", "product.updated"}
 
 def _verify_signature(body: bytes, header_sig: str | None, secret: str) -> bool:
     """Return True if the request signature is valid."""
+    # SECURITY: Webhook secret now required — Phase 0 hardening
     if not secret:
-        # Dev mode: no secret configured — allow all
-        logger.warning("[webhook] COMMERCE_WEBHOOK_SECRET not set — skipping signature check")
-        return True
+        logger.error("[webhook] COMMERCE_WEBHOOK_SECRET not set — rejecting request")
+        return False
     if not header_sig:
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
