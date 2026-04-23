@@ -10,6 +10,8 @@ DEFAULT_ORIGINS = [
     "https://commerce.thronoschain.org",
     "https://api.thronoschain.org",
     "https://assistant.thronoschain.org",
+    "http://localhost:5173",
+    "http://localhost:3000",
 ]
 
 
@@ -24,6 +26,6 @@ def setup_cors(app: FastAPI):
         CORSMiddleware,
         allow_origins=origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Commerce-Key"],
     )
