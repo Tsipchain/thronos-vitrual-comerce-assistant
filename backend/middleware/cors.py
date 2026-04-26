@@ -29,5 +29,10 @@ def setup_cors(app: FastAPI):
         allow_origins=origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Commerce-Key"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Commerce-Key",
+            "X-Thronos-Commerce-Key",
+        ],
     )
