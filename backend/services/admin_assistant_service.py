@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -30,7 +31,7 @@ PROPOSABLE_FIELDS: set[str] = {
     # Footer / contact links
     "footer.contactEmail", "footer.facebookUrl", "footer.instagramUrl",
     "footer.tiktokUrl",
-    # Notification addresses (sensitive - require password on apply side)
+    # Notification addresses (sensitive — require password on apply)
     "notifications.notificationEmail", "notifications.replyToEmail",
     "notifications.enabled",
 }
@@ -41,11 +42,14 @@ SENSITIVE_FIELDS: set[str] = {
     "notifications.enabled",
 }
 
+# Per-provider AI call budget in seconds.
+_AI_TIMEOUT = 20.0
+
 
 class AdminAssistantService:
     def __init__(self) -> None:
         self._anthropic = None
-        self._openai = None
+        self._openai    = None
         self._init_ai_clients()
 
     def _init_ai_clients(self) -> None:
@@ -54,13 +58,13 @@ class AdminAssistantService:
                 import anthropic
                 self._anthropic = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
             except ImportError:
-                logger.warning("anthropic package not installed – admin assistant will use OpenAI or fallback")
+                logger.warning("[admin-assistant] anthropic package not installed")
         if not self._anthropic and settings.openai_api_key:
             try:
                 from openai import AsyncOpenAI
                 self._openai = AsyncOpenAI(api_key=settings.openai_api_key)
             except ImportError:
-                logger.warning("openai package not installed – admin assistant will use keyword fallback")
+                logger.warning("[admin-assistant] openai package not installed")
 
     # ------------------------------------------------------------------
     # System prompt
@@ -71,47 +75,48 @@ class AdminAssistantService:
         if isinstance(store_name, dict):
             store_name = store_name.get("el") or store_name.get("en") or "Unknown"
 
-        tenant_id = tenant_context.get("tenant_id", "unknown")
-        theme = tenant_context.get("theme", {})
-        branding = tenant_context.get("branding", {})
-        assistant_cfg = tenant_context.get("assistant", {})
-        categories_count = tenant_context.get("categories_count", 0)
-        products_count = tenant_context.get("products_count", 0)
+        tenant_id      = tenant_context.get("tenant_id", "unknown")
+        theme          = tenant_context.get("theme", {})
+        branding       = tenant_context.get("branding", {})
+        assistant_cfg  = tenant_context.get("assistant", {})
+        cats           = tenant_context.get("categories_count", 0)
+        prods          = tenant_context.get("products_count", 0)
         allowed_themes = tenant_context.get("allowed_theme_keys", [])
-        support_tier = tenant_context.get("support_tier", "SELF_SERVICE")
+        support_tier   = tenant_context.get("support_tier", "SELF_SERVICE")
 
-        section_note = (
+        section_note   = (
             f"\nThe admin is currently viewing the **{section}** section."
             if section else ""
         )
         proposable_list = "\n".join(f"  - {f}" for f in sorted(PROPOSABLE_FIELDS))
-        sensitive_list = ", ".join(sorted(SENSITIVE_FIELDS))
+        sensitive_list  = ", ".join(sorted(SENSITIVE_FIELDS))
 
         return (
             "You are Βοηθός (Voithos), the AI assistant for tenant administrators "
             "on the Thronos Commerce platform.\n\n"
             "## Your role\n"
-            f"You help the administrator of **{store_name}** (tenantId: `{tenant_id}`) configure "
-            "their own store only.\n\n"
+            f"You help the administrator of **{store_name}** (tenantId: `{tenant_id}`) "
+            "configure their own store only.\n\n"
             "## STRICT TENANT ISOLATION\n"
             "- You ONLY assist with this tenant’s configuration.\n"
             "- You NEVER access, discuss, or propose changes for other tenants.\n"
-            "- You NEVER expose global platform config, root admin data, credentials, or other tenants’ data.\n"
+            "- You NEVER expose global platform config, root admin data, credentials, "
+            "or other tenants’ data.\n"
             "- You NEVER directly apply changes. You only **propose** them.\n"
-            "- The admin must explicitly approve every proposed change before it is applied.\n\n"
+            "- The admin must explicitly approve every proposed change.\n\n"
             "## Current store context\n"
             f"- Store name: {store_name}\n"
             f"- Tenant ID: {tenant_id}\n"
             f"- Support tier: {support_tier}\n"
-            f"- Products: {products_count}, Categories: {categories_count}\n"
+            f"- Products: {prods}, Categories: {cats}\n"
             f"- Allowed theme keys: {', '.join(allowed_themes) if allowed_themes else 'default'}\n"
             f"- Current theme: {json.dumps(theme, ensure_ascii=False)[:500]}\n"
             f"- Branding: {json.dumps(branding, ensure_ascii=False)[:300]}\n"
             f"- Assistant config: {json.dumps(assistant_cfg, ensure_ascii=False)[:300]}\n"
             f"{section_note}\n\n"
             "## How to propose changes\n"
-            "When you want to suggest a config change, include a JSON block at the **end** of your "
-            "response (after your explanation):\n\n"
+            "When you want to suggest a config change, include a JSON block at the "
+            "**end** of your response (after your explanation):\n\n"
             "```json\n"
             "{\n"
             '  "proposed_patches": [\n'
@@ -127,11 +132,12 @@ class AdminAssistantService:
             "```\n\n"
             f"## Proposable fields (ONLY these may appear in proposed_patches)\n"
             f"{proposable_list}\n\n"
-            f"Sensitive fields that require admin password before applying: {sensitive_list}\n\n"
+            f"Sensitive fields that require admin password: {sensitive_list}\n\n"
             "## Rules\n"
             "1. Always explain the proposal in plain language BEFORE the JSON block.\n"
-            "2. Never include forbidden fields (payment credentials, adminPasswordHash, raw server config).\n"
-            "3. If asked for something outside your scope, decline politely and explain why.\n"
+            "2. Never include forbidden fields (payment credentials, adminPasswordHash, "
+            "raw server config).\n"
+            "3. If asked for something outside your scope, decline politely.\n"
             "4. Respond in the same language the admin uses (Greek or English).\n"
             "5. Keep responses concise and actionable.\n"
         )
@@ -155,10 +161,10 @@ class AdminAssistantService:
                     if fp not in PROPOSABLE_FIELDS:
                         continue
                     validated.append({
-                        "field_path": fp,
-                        "current_value": p.get("current_value"),
-                        "proposed_value": p.get("proposed_value"),
-                        "description": str(p.get("description", ""))[:500],
+                        "field_path"      : fp,
+                        "current_value"   : p.get("current_value"),
+                        "proposed_value"  : p.get("proposed_value"),
+                        "description"     : str(p.get("description", ""))[:500],
                         "requires_password": fp in SENSITIVE_FIELDS,
                     })
                 return validated
@@ -169,7 +175,9 @@ class AdminAssistantService:
     @staticmethod
     def _clean_response(text: str) -> str:
         """Strip the JSON proposal block from the user-facing response text."""
-        return re.sub(r"```json\s*\{[\s\S]*?\}\s*```", "", text, flags=re.IGNORECASE).strip()
+        return re.sub(
+            r"```json\s*\{[\s\S]*?\}\s*```", "", text, flags=re.IGNORECASE
+        ).strip()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -183,7 +191,7 @@ class AdminAssistantService:
         conversation_history: Optional[list] = None,
     ) -> dict:
         system_prompt = self._build_system_prompt(tenant_context, section)
-        history = conversation_history or []
+        history       = conversation_history or []
 
         messages: list[dict] = []
         for h in history[-10:]:
@@ -192,46 +200,66 @@ class AdminAssistantService:
                 messages.append({"role": role, "content": h.get("content", "")})
         messages.append({"role": "user", "content": message})
 
+        tenant_id    = (tenant_context or {}).get("tenant_id", "unknown")
         raw_response: Optional[str] = None
 
         if self._anthropic:
             try:
-                result = await self._anthropic.messages.create(
-                    model=settings.anthropic_model,
-                    max_tokens=1024,
-                    system=system_prompt,
-                    messages=messages,
+                result = await asyncio.wait_for(
+                    self._anthropic.messages.create(
+                        model      = settings.anthropic_model,
+                        max_tokens = 1024,
+                        system     = system_prompt,
+                        messages   = messages,
+                    ),
+                    timeout=_AI_TIMEOUT,
                 )
                 raw_response = result.content[0].text
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[admin-assistant] Anthropic timeout tenant=%s timeout_s=%.1f",
+                    tenant_id, _AI_TIMEOUT,
+                )
             except Exception as exc:
-                logger.error("Anthropic admin assistant error: %s", exc)
+                logger.error(
+                    "[admin-assistant] Anthropic error tenant=%s reason=%s",
+                    tenant_id, type(exc).__name__,
+                )
 
         if raw_response is None and self._openai:
             try:
                 all_msgs = [{"role": "system", "content": system_prompt}] + messages
-                result = await self._openai.chat.completions.create(
-                    model=settings.openai_model,
-                    max_tokens=1024,
-                    messages=all_msgs,
+                result   = await asyncio.wait_for(
+                    self._openai.chat.completions.create(
+                        model      = settings.openai_model,
+                        max_tokens = 1024,
+                        messages   = all_msgs,
+                    ),
+                    timeout=_AI_TIMEOUT,
                 )
                 raw_response = result.choices[0].message.content
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[admin-assistant] OpenAI timeout tenant=%s timeout_s=%.1f",
+                    tenant_id, _AI_TIMEOUT,
+                )
             except Exception as exc:
-                logger.error("OpenAI admin assistant error: %s", exc)
+                logger.error(
+                    "[admin-assistant] OpenAI error tenant=%s reason=%s",
+                    tenant_id, type(exc).__name__,
+                )
 
         if raw_response is None:
             raw_response = (
-                "Ο βοηθός δεν είναι "
-                "διαθέσιμος αυτή "
-                "τη στιγμή. "
-                "Παρακαλώ ελέγξτε "
-                "τη σύνδεση AI."
-            )
+                "Ο βοηθός δεν είναι διαθέσιμος αυτή τη στιγμή. "
+                "Παρακαλώ ελέγξτε τη σύνδεση AI."
+        )
 
         proposed_patches = self._parse_proposed_patches(raw_response)
-        clean_response = self._clean_response(raw_response)
+        clean_response   = self._clean_response(raw_response)
 
         return {
-            "response": clean_response,
+            "response"        : clean_response,
             "proposed_patches": proposed_patches,
-            "intent": "admin_config" if proposed_patches else "admin_guidance",
+            "intent"          : "admin_config" if proposed_patches else "admin_guidance",
         }
