@@ -1,8 +1,9 @@
+import asyncio
 import logging
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,7 +30,7 @@ class TokenResponse(BaseModel):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """Simple login - creates shop if needed. In production, integrate with Thronos auth."""
+    """Simple login — creates shop if needed."""
     result = await db.execute(
         select(Shop).where(Shop.owner_email == request.email)
     )
@@ -44,7 +45,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
         db.add(shop)
         await db.commit()
         await db.refresh(shop)
-        logger.info(f"New shop created: {shop.id} for {request.email}")
+        logger.info("[auth] new shop created shop_id=%s", shop.id)
     else:
         user_id = shop.owner_id
 
@@ -58,23 +59,31 @@ class CustomerTokenRequest(BaseModel):
     customer_email: str | None = None
 
 
+# DB lookup budget: must finish well within the commerce-side axios timeout (15 s).
+_DB_TIMEOUT = float(os.getenv("VCA_AUTH_DB_TIMEOUT_S", "8"))
+
+
 @router.post("/customer-token", response_model=TokenResponse)
 async def customer_token(
     request: CustomerTokenRequest,
     db: AsyncSession = Depends(get_db),
     x_thronos_commerce_key: str | None = Header(default=None, alias="X-Thronos-Commerce-Key"),
-):
-    """Issue a scoped customer JWT for a commerce tenant's storefront widget.
-
-    Requires the caller to supply the shared secret via X-Thronos-Commerce-Key.
-    Set THRONOS_COMMERCE_API_KEY on this service to enable the check.
-    If the env var is absent the check is skipped with a warning (dev mode).
+) -> TokenResponse:
     """
+    Issue a scoped customer JWT for a commerce tenant’s storefront widget.
+
+    Auth: X-Thronos-Commerce-Key must match THRONOS_COMMERCE_API_KEY env var.
+    When THRONOS_COMMERCE_API_KEY is absent the check is skipped (dev mode).
+    """
+    tenant_id = request.commerce_tenant_id  # logged throughout — not a secret
+
+    # --- key check (never log the key value) ---
     expected_key = os.getenv("THRONOS_COMMERCE_API_KEY", "").strip()
     if expected_key:
         if not x_thronos_commerce_key or x_thronos_commerce_key != expected_key:
             logger.warning(
-                "[auth] /customer-token rejected — invalid or missing X-Thronos-Commerce-Key"
+                "[auth] customer-token rejected tenant=%s reason=invalid_commerce_key",
+                tenant_id,
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -82,23 +91,52 @@ async def customer_token(
             )
     else:
         logger.warning(
-            "[auth] THRONOS_COMMERCE_API_KEY not set — skipping commerce-key check (dev mode)"
+            "[auth] THRONOS_COMMERCE_API_KEY not set — skipping key check (dev mode)"
         )
 
-    result = await db.execute(
-        select(Shop).where(Shop.commerce_tenant_id == request.commerce_tenant_id)
-    )
-    shop = result.scalar_one_or_none()
+    # --- shop lookup with timeout ---
+    try:
+        result = await asyncio.wait_for(
+            db.execute(select(Shop).where(Shop.commerce_tenant_id == tenant_id)),
+            timeout=_DB_TIMEOUT,
+        )
+        shop = result.scalar_one_or_none()
+    except asyncio.TimeoutError:
+        logger.error(
+            "[auth] customer-token DB timeout tenant=%s timeout_s=%.1f",
+            tenant_id, _DB_TIMEOUT,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Shop lookup timed out — please retry",
+        )
+    except Exception as exc:
+        logger.error(
+            "[auth] customer-token DB error tenant=%s reason=%s",
+            tenant_id, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Shop lookup failed",
+        )
+
     if not shop:
+        logger.warning(
+            "[auth] customer-token not_found tenant=%s", tenant_id
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No shop linked to commerce_tenant_id={request.commerce_tenant_id!r}",
+            detail=f"No shop linked to commerce_tenant_id={tenant_id!r}",
         )
+
     customer_id = request.customer_id or str(uuid.uuid4())
     token = create_access_token(
         user_id=customer_id,
         email=request.customer_email or "",
         role="customer",
         shop_id=shop.id,
+    )
+    logger.info(
+        "[auth] customer-token issued tenant=%s shop=%s", tenant_id, shop.id
     )
     return TokenResponse(access_token=token, user_id=customer_id, shop_id=shop.id)

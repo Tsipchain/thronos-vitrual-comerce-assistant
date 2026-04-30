@@ -1,20 +1,17 @@
-"""Webhook receiver: thronos-commerce → assistant.
-
-Endpoint: POST /api/v1/webhooks/commerce
-
-Security: HMAC-SHA256 signature in X-Thronos-Signature header.
-  Format: sha256=<hex digest>
-  Key:    COMMERCE_WEBHOOK_SECRET env var (both sides must share the same value)
-  If the secret is not configured, all webhook requests are rejected with 401.
-
-Supported events:
-  order.placed          → upsert order + items
-  order.status_changed  → update order status / tracking
-  product.updated       → upsert product
 """
+Webhook receiver: thronos-commerce → assistant.
+
+Endpoint : POST /api/v1/webhooks/commerce
+Security : HMAC-SHA256 in X-Thronos-Signature (sha256=<hex>).
+           Key: COMMERCE_WEBHOOK_SECRET (shared with commerce).
+           Requests without a valid signature are rejected with 401.
+Supported: order.placed | order.status_changed | product.updated
+"""
+import asyncio
 import hashlib
 import hmac
 import logging
+import os
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,12 +25,14 @@ router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
 
 SUPPORTED_EVENTS = {"order.placed", "order.status_changed", "product.updated"}
 
+# Sync ops budget: must finish before Railway’s 30-s reverse-proxy limit.
+_SYNC_TIMEOUT = float(os.getenv("VCA_SYNC_TIMEOUT_S", "10"))
+
 
 def _verify_signature(body: bytes, header_sig: str | None, secret: str) -> bool:
-    """Return True if the request signature is valid."""
-    # SECURITY: Webhook secret now required — Phase 0 hardening
+    """Return True iff the HMAC-SHA256 signature is valid. Never logs the secret."""
     if not secret:
-        logger.error("[webhook] COMMERCE_WEBHOOK_SECRET not set — rejecting request")
+        logger.error("[webhook] COMMERCE_WEBHOOK_SECRET not set — rejecting all requests")
         return False
     if not header_sig:
         return False
@@ -52,45 +51,75 @@ async def receive_commerce_webhook(
 
     secret = settings.commerce_webhook_secret or ""
     if not _verify_signature(body, x_thronos_signature, secret):
-        logger.warning("[webhook] Invalid signature — rejected")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
+        logger.warning(
+            "[webhook] path=POST /api/v1/webhooks/commerce reason=invalid_signature"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature",
+        )
 
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    event = str(payload.get("event") or "").strip()
+    event     = str(payload.get("event")     or "").strip()
     tenant_id = str(payload.get("tenant_id") or "").strip()
-    data = payload.get("data") or {}
+    data      = payload.get("data") or {}
 
     if not event or not tenant_id:
-        raise HTTPException(status_code=400, detail="Missing required fields: event, tenant_id")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required fields: event, tenant_id",
+        )
 
     if event not in SUPPORTED_EVENTS:
-        logger.info("[webhook] Unsupported event '%s' — acknowledged and ignored", event)
+        logger.info(
+            "[webhook] unsupported event=%s tenant=%s — acknowledged and ignored",
+            event, tenant_id,
+        )
         return {"status": "ignored", "event": event}
 
-    logger.info("[webhook] Received %s for tenant=%s", event, tenant_id)
+    logger.info("[webhook] received event=%s tenant=%s", event, tenant_id)
 
     try:
         if event == "order.placed":
-            ok = await sync_svc.sync_order_placed(db, tenant_id, data)
+            coro = sync_svc.sync_order_placed(db, tenant_id, data)
         elif event == "order.status_changed":
-            ok = await sync_svc.sync_order_status_changed(db, tenant_id, data)
-        elif event == "product.updated":
-            ok = await sync_svc.sync_product_updated(db, tenant_id, data)
-        else:
-            ok = False
+            coro = sync_svc.sync_order_status_changed(db, tenant_id, data)
+        else:  # product.updated
+            coro = sync_svc.sync_product_updated(db, tenant_id, data)
+
+        ok = await asyncio.wait_for(coro, timeout=_SYNC_TIMEOUT)
 
         if ok:
             await db.commit()
         else:
-            logger.warning("[webhook] Handler returned False for %s / tenant=%s", event, tenant_id)
+            logger.warning(
+                "[webhook] handler returned False event=%s tenant=%s", event, tenant_id
+            )
 
+    except asyncio.TimeoutError:
+        await db.rollback()
+        logger.error(
+            "[webhook] sync timeout event=%s tenant=%s timeout_s=%.1f",
+            event, tenant_id, _SYNC_TIMEOUT,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Sync operation timed out",
+        )
     except Exception as exc:
         await db.rollback()
-        logger.error("[webhook] Error processing %s: %s", event, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Webhook processing error")
+        logger.error(
+            "[webhook] processing error event=%s tenant=%s reason=%s",
+            event, tenant_id, type(exc).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Webhook processing error",
+        )
 
     return {"status": "ok", "event": event, "tenant_id": tenant_id}
