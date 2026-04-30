@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import settings
 from dependencies.database import get_db
 from models.shop import Shop
 from services.auth import create_access_token
@@ -26,6 +27,12 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user_id: str
     shop_id: str
+
+
+class CustomerTokenResponse(BaseModel):
+    ok: bool = True
+    token: str
+    expiresIn: int
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -63,27 +70,44 @@ class CustomerTokenRequest(BaseModel):
 _DB_TIMEOUT = float(os.getenv("VCA_AUTH_DB_TIMEOUT_S", "8"))
 
 
-@router.post("/customer-token", response_model=TokenResponse)
+def _resolve_shared_secret() -> tuple[str, str]:
+    """Return (secret, source_name) using canonical priority order.
+
+    COMMERCE_WEBHOOK_SECRET (primary) -> ASSISTANT_WEBHOOK_SECRET (legacy fallback).
+    Never returns the secret value in logs — only the source name.
+    """
+    primary = (settings.commerce_webhook_secret or "").strip()
+    if primary:
+        return primary, "COMMERCE_WEBHOOK_SECRET"
+    fallback = os.getenv("ASSISTANT_WEBHOOK_SECRET", "").strip()
+    if fallback:
+        return fallback, "ASSISTANT_WEBHOOK_SECRET"
+    return "", "none"
+
+
+@router.post("/customer-token", response_model=CustomerTokenResponse)
 async def customer_token(
     request: CustomerTokenRequest,
     db: AsyncSession = Depends(get_db),
     x_thronos_commerce_key: str | None = Header(default=None, alias="X-Thronos-Commerce-Key"),
-) -> TokenResponse:
-    """
-    Issue a scoped customer JWT for a commerce tenant’s storefront widget.
+) -> CustomerTokenResponse:
+    """Issue a scoped customer JWT for a commerce tenant's storefront widget.
 
-    Auth: X-Thronos-Commerce-Key must match THRONOS_COMMERCE_API_KEY env var.
-    When THRONOS_COMMERCE_API_KEY is absent the check is skipped (dev mode).
+    Auth: X-Thronos-Commerce-Key must match the resolved shared secret.
+    Secret resolution: COMMERCE_WEBHOOK_SECRET -> ASSISTANT_WEBHOOK_SECRET.
+    When no secret is configured the check is skipped (dev mode, logs warning).
+    Does not call any LLM — lightweight DB lookup only.
     """
-    tenant_id = request.commerce_tenant_id  # logged throughout — not a secret
+    tenant_id = request.commerce_tenant_id
 
-    # --- key check (never log the key value) ---
-    expected_key = os.getenv("THRONOS_COMMERCE_API_KEY", "").strip()
+    # --- canonical shared-secret check (never log key values) ---
+    expected_key, secret_source = _resolve_shared_secret()
     if expected_key:
         if not x_thronos_commerce_key or x_thronos_commerce_key != expected_key:
             logger.warning(
-                "[auth] customer-token rejected tenant=%s reason=invalid_commerce_key",
-                tenant_id,
+                "[auth] customer-token rejected route=/api/v1/auth/customer-token "
+                "tenantId=%s reason=invalid_key secretSource=%s",
+                tenant_id, secret_source,
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -91,7 +115,7 @@ async def customer_token(
             )
     else:
         logger.warning(
-            "[auth] THRONOS_COMMERCE_API_KEY not set — skipping key check (dev mode)"
+            "[auth] no shared secret configured (secretSource=none) — key check skipped (dev mode)"
         )
 
     # --- shop lookup with timeout ---
@@ -103,7 +127,8 @@ async def customer_token(
         shop = result.scalar_one_or_none()
     except asyncio.TimeoutError:
         logger.error(
-            "[auth] customer-token DB timeout tenant=%s timeout_s=%.1f",
+            "[auth] customer-token DB timeout route=/api/v1/auth/customer-token "
+            "tenantId=%s timeout_s=%.1f reason=timeout",
             tenant_id, _DB_TIMEOUT,
         )
         raise HTTPException(
@@ -112,7 +137,8 @@ async def customer_token(
         )
     except Exception as exc:
         logger.error(
-            "[auth] customer-token DB error tenant=%s reason=%s",
+            "[auth] customer-token DB error route=/api/v1/auth/customer-token "
+            "tenantId=%s reason=%s",
             tenant_id, type(exc).__name__,
         )
         raise HTTPException(
@@ -122,7 +148,8 @@ async def customer_token(
 
     if not shop:
         logger.warning(
-            "[auth] customer-token not_found tenant=%s", tenant_id
+            "[auth] customer-token not_found route=/api/v1/auth/customer-token tenantId=%s reason=not_found",
+            tenant_id,
         )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -130,13 +157,18 @@ async def customer_token(
         )
 
     customer_id = request.customer_id or str(uuid.uuid4())
-    token = create_access_token(
+    raw_token = create_access_token(
         user_id=customer_id,
         email=request.customer_email or "",
         role="customer",
         shop_id=shop.id,
     )
     logger.info(
-        "[auth] customer-token issued tenant=%s shop=%s", tenant_id, shop.id
+        "[auth] customer-token issued route=/api/v1/auth/customer-token tenantId=%s shop=%s",
+        tenant_id, shop.id,
     )
-    return TokenResponse(access_token=token, user_id=customer_id, shop_id=shop.id)
+    return CustomerTokenResponse(
+        ok=True,
+        token=raw_token,
+        expiresIn=settings.jwt_expiration_minutes * 60,
+    )
