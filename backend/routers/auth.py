@@ -1,3 +1,15 @@
+"""
+POST /api/v1/auth/customer-token
+
+Server-to-server endpoint — no LLM calls, no AI dependencies.
+Commerce calls this to get a short-lived JWT for a storefront session.
+
+Auth:   X-Thronos-Commerce-Key header matched against COMMERCE_WEBHOOK_SECRET
+        (fallback: ASSISTANT_WEBHOOK_SECRET for legacy compatibility).
+JWT:    signed with JWT_SECRET_KEY (fallback: JWT_SECRET).
+Body:   { "tenantId": "...", "host": "...", "lang": "..." }
+Return: { "token": "...", "expiresIn": <seconds> }
+"""
 import asyncio
 import logging
 import os
@@ -5,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,16 +28,15 @@ from models.shop import Shop
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
 
-# DB lookup budget well within the commerce-side axios timeout (15 s).
 _DB_TIMEOUT = float(os.getenv("VCA_AUTH_DB_TIMEOUT_S", "8"))
 
 
 # ---------------------------------------------------------------------------
-# Shared-secret resolution
+# Secret / key resolution helpers
 # ---------------------------------------------------------------------------
 
 def _resolve_shared_secret() -> tuple[str, str]:
-    """Return (secret, source_name). Never log the secret value."""
+    """Return (expected_secret, source_name). Never log the value."""
     primary = (getattr(settings, "commerce_webhook_secret", "") or "").strip()
     if primary:
         return primary, "COMMERCE_WEBHOOK_SECRET"
@@ -35,22 +46,30 @@ def _resolve_shared_secret() -> tuple[str, str]:
     return "", "none"
 
 
-# ---------------------------------------------------------------------------
-# JWT signing — inline, no dependency on services.auth
-# ---------------------------------------------------------------------------
+def _resolve_jwt_secret() -> tuple[str, str]:
+    """Return (jwt_secret, source_name). JWT_SECRET_KEY first, JWT_SECRET fallback."""
+    # Try settings attribute (pydantic-settings reads JWT_SECRET_KEY from env)
+    primary = (getattr(settings, "jwt_secret_key", "") or "").strip()
+    if primary:
+        return primary, "JWT_SECRET_KEY"
+    # Raw env fallback in case the var is named JWT_SECRET
+    fallback = os.getenv("JWT_SECRET", "").strip()
+    if fallback:
+        return fallback, "JWT_SECRET"
+    return "", "none"
 
-def _sign_jwt(
-    user_id: str,
-    email: str,
-    role: str,
+
+def _sign_customer_jwt(
+    customer_id: str,
+    tenant_id: str,
     shop_id: str | None,
     expiry_minutes: int,
 ) -> tuple[str, int]:
-    """Return (token, expires_in_seconds). Raises HTTPException 500 on failure."""
-    jwt_secret = (getattr(settings, "jwt_secret_key", "") or "").strip()
+    """Sign and return (token, expires_in_seconds). Raises HTTPException 500 on failure."""
+    jwt_secret, jwt_source = _resolve_jwt_secret()
     if not jwt_secret:
         logger.error(
-            "[auth] JWT_SECRET_KEY not configured — cannot sign token"
+            "[auth] customer-token JWT secret missing — set JWT_SECRET_KEY or JWT_SECRET"
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -59,9 +78,9 @@ def _sign_jwt(
 
     now = datetime.utcnow()
     payload = {
-        "sub": user_id,
-        "email": email,
-        "role": role,
+        "sub": customer_id,
+        "role": "customer",
+        "tenant_id": tenant_id,
         "shop_id": shop_id,
         "exp": now + timedelta(minutes=expiry_minutes),
         "iat": now,
@@ -70,18 +89,37 @@ def _sign_jwt(
     try:
         from jose import jwt as jose_jwt
         token = jose_jwt.encode(payload, jwt_secret, algorithm="HS256")
+        logger.debug("[auth] JWT signed jwtSource=%s", jwt_source)
+        return token, expiry_minutes * 60
     except Exception as exc:
-        logger.error("[auth] JWT encode failed reason=%s", type(exc).__name__)
+        logger.error(
+            "[auth] JWT encode failed jwtSource=%s reason=%s",
+            jwt_source, type(exc).__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to sign token",
         )
 
-    return token, expiry_minutes * 60
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+class CustomerTokenRequest(BaseModel):
+    # Primary field (new format from Commerce)
+    tenantId: str = Field(..., description="Commerce tenant identifier (e.g. 'eukolakis')")
+    host: str | None = Field(None, description="Requesting host for logging")
+    lang: str | None = Field(None, description="Language hint")
+
+
+class CustomerTokenResponse(BaseModel):
+    token: str
+    expiresIn: int
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Legacy login endpoint (unchanged)
 # ---------------------------------------------------------------------------
 
 class LoginRequest(BaseModel):
@@ -95,22 +133,6 @@ class TokenResponse(BaseModel):
     user_id: str
     shop_id: str
 
-
-class CustomerTokenRequest(BaseModel):
-    commerce_tenant_id: str
-    customer_id: str | None = None
-    customer_email: str | None = None
-
-
-class CustomerTokenResponse(BaseModel):
-    ok: bool = True
-    token: str
-    expiresIn: int
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
@@ -139,69 +161,69 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     return TokenResponse(access_token=token, user_id=user_id, shop_id=shop.id)
 
 
+# ---------------------------------------------------------------------------
+# Customer token endpoint
+# ---------------------------------------------------------------------------
+
 @router.post("/customer-token", response_model=CustomerTokenResponse)
 async def customer_token(
-    request_body: CustomerTokenRequest,
+    body: CustomerTokenRequest,
     http_request: Request,
     db: AsyncSession = Depends(get_db),
-    x_thronos_commerce_key: str | None = Header(default=None, alias="X-Thronos-Commerce-Key"),
+    x_thronos_commerce_key: str | None = Header(
+        default=None, alias="X-Thronos-Commerce-Key"
+    ),
 ) -> CustomerTokenResponse:
-    """Issue a scoped customer JWT for a commerce tenant's storefront widget.
+    tenant_id = body.tenantId.strip()
+    req_host = (body.host or http_request.headers.get("host", "-")).strip()
+    lang = body.lang or "el"
 
-    Lightweight — no LLM calls.
-    Auth: X-Thronos-Commerce-Key resolved via COMMERCE_WEBHOOK_SECRET → ASSISTANT_WEBHOOK_SECRET.
-    Wrong key → 401. Missing JWT_SECRET_KEY → 500. DB down → 503.
-    """
-    tenant_id = request_body.commerce_tenant_id
-    host = http_request.headers.get("host", "-")
+    # ── resolve secrets (log names only, never values) ───────────────────────
+    expected_key, secret_source = _resolve_shared_secret()
+    _, jwt_source = _resolve_jwt_secret()
 
-    # --- shared-secret check (log source name only, never the value) ---
-    try:
-        expected_key, secret_source = _resolve_shared_secret()
-    except Exception as exc:
-        logger.error(
-            "[auth] customer-token secret resolution failed tenantId=%s host=%s reason=%s",
-            tenant_id, host, type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server configuration error",
-        )
+    has_commerce_secret = bool(expected_key)
+    has_jwt_secret = bool(jwt_source != "none")
 
     logger.info(
-        "[auth] customer-token hit tenantId=%s host=%s secretSource=%s "
-        "jwt_secret_present=%s",
-        tenant_id, host, secret_source,
-        bool((getattr(settings, "jwt_secret_key", "") or "").strip()),
+        "[auth] customer-token entered tenantId=%s host=%s lang=%s "
+        "hasCommerceSecret=%s secretSource=%s hasJwtSecret=%s jwtSource=%s",
+        tenant_id, req_host, lang,
+        has_commerce_secret, secret_source,
+        has_jwt_secret, jwt_source,
     )
 
+    # ── shared-secret validation ──────────────────────────────────────────────
     if expected_key:
-        if not x_thronos_commerce_key or x_thronos_commerce_key.strip() != expected_key:
+        incoming = (x_thronos_commerce_key or "").strip()
+        if not incoming or incoming != expected_key:
             logger.warning(
-                "[auth] customer-token rejected tenantId=%s host=%s "
-                "reason=invalid_key secretSource=%s",
-                tenant_id, host, secret_source,
+                "[auth] customer-token REJECTED tenantId=%s host=%s "
+                "reason=invalid_commerce_key secretSource=%s",
+                tenant_id, req_host, secret_source,
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid commerce key",
+                detail="Invalid or missing X-Thronos-Commerce-Key",
             )
     else:
         logger.warning(
-            "[auth] no shared secret configured (secretSource=none) "
-            "— key check skipped (dev mode)"
+            "[auth] customer-token key check SKIPPED — no secret configured "
+            "(secretSource=none, dev mode)"
         )
 
-    # --- shop lookup with timeout ---
+    # ── shop lookup ───────────────────────────────────────────────────────────
     try:
         result = await asyncio.wait_for(
-            db.execute(select(Shop).where(Shop.commerce_tenant_id == tenant_id)),
+            db.execute(
+                select(Shop).where(Shop.commerce_tenant_id == tenant_id)
+            ),
             timeout=_DB_TIMEOUT,
         )
         shop = result.scalar_one_or_none()
     except asyncio.TimeoutError:
         logger.error(
-            "[auth] customer-token DB timeout tenantId=%s timeout_s=%.1f reason=timeout",
+            "[auth] customer-token DB TIMEOUT tenantId=%s timeout_s=%.1f",
             tenant_id, _DB_TIMEOUT,
         )
         raise HTTPException(
@@ -212,8 +234,8 @@ async def customer_token(
         raise
     except Exception as exc:
         logger.error(
-            "[auth] customer-token DB error tenantId=%s reason=%s",
-            tenant_id, type(exc).__name__,
+            "[auth] customer-token DB ERROR tenantId=%s reason=%s error=%s",
+            tenant_id, type(exc).__name__, str(exc),
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -222,28 +244,31 @@ async def customer_token(
 
     if not shop:
         logger.warning(
-            "[auth] customer-token tenantId=%s reason=not_found",
-            tenant_id,
+            "[auth] customer-token NOT_FOUND tenantId=%s host=%s "
+            "reason=no_shop_linked",
+            tenant_id, req_host,
         )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No shop linked to commerce_tenant_id={tenant_id!r}. "
-                   "Register the shop in VCA first.",
+            detail=(
+                f"No VCA shop is linked to tenantId={tenant_id!r}. "
+                "Run the seed script or link the shop in the VCA admin."
+            ),
         )
 
-    # --- sign token ---
-    customer_id = request_body.customer_id or str(uuid.uuid4())
+    # ── sign JWT ──────────────────────────────────────────────────────────────
+    customer_id = str(uuid.uuid4())
     expiry_minutes = int(getattr(settings, "jwt_expiration_minutes", 1440))
-    raw_token, expires_in = _sign_jwt(
-        user_id=customer_id,
-        email=request_body.customer_email or "",
-        role="customer",
-        shop_id=shop.id,
+
+    token, expires_in = _sign_customer_jwt(
+        customer_id=customer_id,
+        tenant_id=tenant_id,
+        shop_id=str(shop.id),
         expiry_minutes=expiry_minutes,
     )
 
     logger.info(
-        "[auth] customer-token issued tenantId=%s shop=%s expiresIn=%d",
+        "[auth] customer-token ISSUED tenantId=%s shop_id=%s expiresIn=%d",
         tenant_id, shop.id, expires_in,
     )
-    return CustomerTokenResponse(ok=True, token=raw_token, expiresIn=expires_in)
+    return CustomerTokenResponse(token=token, expiresIn=expires_in)
