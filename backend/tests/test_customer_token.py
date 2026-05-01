@@ -2,10 +2,10 @@
 Regression tests for POST /api/v1/auth/customer-token.
 
 Verifies:
-  T1  valid COMMERCE_WEBHOOK_SECRET + known shop → 200 {ok, token, expiresIn}
+  T1  valid COMMERCE_WEBHOOK_SECRET + known shop → 200 {token, expiresIn}
   T2  wrong key → 401 JSON (not 502 crash)
   T3  missing key header → 401 JSON
-  T4  missing commerce_tenant_id body field → 422 validation error
+  T4  missing tenantId body field → 422 validation error
   T5  missing JWT_SECRET_KEY → 500 JSON (not silent crash)
   T6  no LLM import in routers/auth.py
   T7  _resolve_shared_secret priority: COMMERCE_WEBHOOK_SECRET wins
@@ -92,7 +92,10 @@ def _install_stubs():
             def __init__(self, **kwargs):
                 for k, v in kwargs.items():
                     setattr(self, k, v)
-        pydantic = _make_stub("pydantic", BaseModel=_BaseModel)
+        class _Field:
+            def __new__(cls, *args, **kwargs):
+                return None
+        pydantic = _make_stub("pydantic", BaseModel=_BaseModel, Field=_Field)
         sys.modules["pydantic"] = pydantic
 
     # jose stub — simulate successful import
@@ -101,7 +104,7 @@ def _install_stubs():
             @staticmethod
             def encode(payload, key, algorithm="HS256"):
                 import base64, json
-                return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode() + ".sig"
+                return base64.urlsafe_b64encode(json.dumps(payload, default=str).encode()).decode() + ".sig"
 
         jose = _make_stub("jose", jwt=_Jwt(), JWTError=Exception)
         sys.modules["jose"] = jose
@@ -151,7 +154,7 @@ sys.modules["models"] = _shop_mod
 sys.modules["models.shop"] = _make_stub("models.shop", Shop=_shop_cls)
 
 # Now import what we actually want to test
-from routers.auth import _resolve_shared_secret, _sign_jwt, CustomerTokenResponse  # noqa: E402
+from routers.auth import _resolve_shared_secret, _sign_customer_jwt, CustomerTokenResponse  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +210,9 @@ def test_T9_source_none_when_neither_set(monkeypatch):
 def test_T5_missing_jwt_secret_raises_500(monkeypatch):
     from fastapi import HTTPException
     monkeypatch.setattr(_cfg_mod.settings, "jwt_secret_key", "")
+    monkeypatch.delenv("JWT_SECRET", raising=False)
     try:
-        _sign_jwt("uid", "email@x.com", "customer", "shop-id", 60)
+        _sign_customer_jwt("uid", "tenant-x", "shop-id", 60)
         assert False, "Expected HTTPException"
     except HTTPException as exc:
         assert exc.status_code == 500
@@ -239,63 +243,8 @@ def test_T10_get_db_503_when_session_none():
 # T1-T4 — HTTP-level tests using FastAPI TestClient
 # ---------------------------------------------------------------------------
 
-def _build_test_app(shop_found: bool = True, db_ready: bool = True):
-    """
-    Build a minimal FastAPI app with the customer-token router wired up
-    but all heavy dependencies stubbed.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    import importlib, sys
-
-    # Patch _sign_jwt to succeed with a deterministic token.
-    import routers.auth as auth_mod
-    original_sign = auth_mod._sign_jwt
-
-    def fake_sign(user_id, email, role, shop_id, expiry_minutes):
-        return "fake-jwt-token", expiry_minutes * 60
-
-    auth_mod._sign_jwt = fake_sign
-
-    # Patch get_db to return a working async session or raise 503.
-    from fastapi import HTTPException
-
-    async def fake_get_db():
-        if not db_ready:
-            raise HTTPException(status_code=503, detail="DB down")
-        db = AsyncMock()
-        scalar = MagicMock()
-        if shop_found:
-            shop = MagicMock()
-            shop.id = str(uuid.uuid4())
-            shop.commerce_tenant_id = "tenant-abc"
-        else:
-            shop = None
-        scalar.scalar_one_or_none.return_value = shop
-        db.execute = AsyncMock(return_value=scalar)
-        yield db
-
-    # Build a real FastAPI app for test client
-    try:
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-    except ImportError:
-        return None, None, original_sign
-
-    real_fastapi = importlib.import_module("fastapi")
-    app = real_fastapi.FastAPI()
-
-    import importlib
-    real_router_mod = importlib.import_module("routers.auth")
-    # Override get_db in the router module
-    real_router_mod.get_db = fake_get_db
-    app.include_router(real_router_mod.router)
-
-    return app, original_sign
-
-
 def test_T1_valid_secret_returns_200():
-    """Valid COMMERCE_WEBHOOK_SECRET + known shop → 200 with {ok, token, expiresIn}."""
+    """Valid COMMERCE_WEBHOOK_SECRET + known shop → 200 with {token, expiresIn}."""
     try:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -307,8 +256,8 @@ def test_T1_valid_secret_returns_200():
     import routers.auth as auth_mod
     from unittest.mock import AsyncMock, MagicMock
 
-    original_sign = auth_mod._sign_jwt
-    auth_mod._sign_jwt = lambda uid, email, role, shop_id, expiry: ("fake-token", 3600)
+    original_sign = auth_mod._sign_customer_jwt
+    auth_mod._sign_customer_jwt = lambda customer_id, tenant_id, shop_id, expiry: ("fake-token", 3600)
 
     async def fake_get_db():
         db = AsyncMock()
@@ -331,16 +280,15 @@ def test_T1_valid_secret_returns_200():
 
         resp = client.post(
             "/api/v1/auth/customer-token",
-            json={"commerce_tenant_id": "tenant-abc"},
+            json={"tenantId": "tenant-abc", "host": "www.example.com", "lang": "el"},
             headers={"X-Thronos-Commerce-Key": "valid-secret"},
         )
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
         body = resp.json()
-        assert body.get("ok") is True
         assert body.get("token") == "fake-token"
         assert body.get("expiresIn") == 3600
     finally:
-        auth_mod._sign_jwt = original_sign
+        auth_mod._sign_customer_jwt = original_sign
         auth_mod.get_db = original_get_db
 
 
@@ -363,7 +311,7 @@ def test_T2_wrong_secret_returns_401():
 
     resp = client.post(
         "/api/v1/auth/customer-token",
-        json={"commerce_tenant_id": "tenant-abc"},
+        json={"tenantId": "tenant-abc"},
         headers={"X-Thronos-Commerce-Key": "WRONG"},
     )
     assert resp.status_code == 401, f"Expected 401, got {resp.status_code}: {resp.text}"
@@ -389,13 +337,13 @@ def test_T3_missing_key_header_returns_401():
 
     resp = client.post(
         "/api/v1/auth/customer-token",
-        json={"commerce_tenant_id": "tenant-abc"},
+        json={"tenantId": "tenant-abc"},
     )
     assert resp.status_code == 401
 
 
 def test_T4_missing_tenant_id_returns_422():
-    """Missing commerce_tenant_id → 422 validation (not 500)."""
+    """Missing tenantId → 422 validation (not 500)."""
     try:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
