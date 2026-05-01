@@ -5,7 +5,8 @@ import pkgutil
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
 
 from core.config import settings, validate_environment
@@ -38,10 +39,20 @@ async def lifespan(app: FastAPI):
     logger = logging.getLogger(__name__)
     logger.info("=== Application startup initiated ===")
     validate_environment()
+
+    # Log critical env presence (never values).
+    logger.info(
+        "[boot] jwt_secret_key_present=%s commerce_webhook_secret_present=%s",
+        bool(getattr(settings, "jwt_secret_key", None)),
+        bool(getattr(settings, "commerce_webhook_secret", None)),
+    )
+
     try:
         await initialize_database()
-    except Exception as e:
-        logger.error(f"Startup failed (continuing without full DB): {e}")
+        logger.info("[boot] database initialized")
+    except Exception as exc:
+        logger.error("[boot] database init failed (continuing without full DB): %s", type(exc).__name__)
+
     logger.info("=== Application startup completed ===")
     yield
     await close_database()
@@ -55,6 +66,24 @@ app = FastAPI(
 )
 
 setup_cors(app)
+
+
+# ---------------------------------------------------------------------------
+# Global exception handler — ensures any unhandled exception returns JSON 500
+# instead of dropping the connection (which Railway logs as 502).
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger = logging.getLogger(__name__)
+    logger.error(
+        "[uncaught] method=%s path=%s reason=%s",
+        request.method, request.url.path, type(exc).__name__,
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 
 def include_routers_from_package(app: FastAPI, package_name: str = "routers") -> None:
@@ -101,7 +130,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    import services.database as _db_svc
+    return {
+        "status": "healthy",
+        "db_ready": _db_svc.async_session is not None,
+        "jwt_secret_configured": bool(getattr(settings, "jwt_secret_key", None)),
+    }
 
 
 if __name__ == "__main__":
