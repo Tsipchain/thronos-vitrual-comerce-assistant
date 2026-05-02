@@ -10,7 +10,6 @@ JWT:    signed with JWT_SECRET_KEY (fallback: JWT_SECRET).
 Body:   { "tenantId": "...", "host": "...", "lang": "..." }
 Return: { "token": "...", "expiresIn": <seconds> }
 """
-import asyncio
 import logging
 import os
 import uuid
@@ -27,8 +26,6 @@ from models.shop import Shop
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
-
-_DB_TIMEOUT = float(os.getenv("VCA_AUTH_DB_TIMEOUT_S", "8"))
 
 
 # ---------------------------------------------------------------------------
@@ -213,33 +210,25 @@ async def customer_token(
         )
 
     # ── shop lookup ───────────────────────────────────────────────────────────
+    # asyncio.wait_for is intentionally avoided: cancelling a SQLAlchemy async
+    # coroutine mid-flight leaves the session in a broken state, causing the
+    # cleanup (rollback/close) to raise and drop the TCP connection.
+    # DB-level timeouts (asyncpg command_timeout / statement_timeout) handle this instead.
     try:
-        result = await asyncio.wait_for(
-            db.execute(
-                select(Shop).where(Shop.commerce_tenant_id == tenant_id)
-            ),
-            timeout=_DB_TIMEOUT,
+        result = await db.execute(
+            select(Shop).where(Shop.commerce_tenant_id == tenant_id)
         )
         shop = result.scalar_one_or_none()
-    except asyncio.TimeoutError:
-        logger.error(
-            "[auth] customer-token DB TIMEOUT tenantId=%s timeout_s=%.1f",
-            tenant_id, _DB_TIMEOUT,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Shop lookup timed out — please retry",
-        )
     except HTTPException:
         raise
     except Exception as exc:
         logger.error(
-            "[auth] customer-token DB ERROR tenantId=%s reason=%s error=%s",
-            tenant_id, type(exc).__name__, str(exc),
+            "[auth] customer-token DB ERROR tenantId=%s reason=%s",
+            tenant_id, type(exc).__name__,
         )
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Shop lookup failed",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Shop lookup failed — please retry",
         )
 
     if not shop:
