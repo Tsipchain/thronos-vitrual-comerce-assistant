@@ -20,8 +20,7 @@ class Settings(BaseSettings):
     database_public_url: str | None = None   # DATABASE_PUBLIC_URL
 
     # Auth
-    # SECURITY: Default JWT secret removed — Phase 0 hardening
-    jwt_secret_key: str
+    jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 1440
 
@@ -95,9 +94,11 @@ def validate_environment():
             "No database URL configured (checked: " + ", ".join(_db_url_vars) + ") – "
             "using in-memory SQLite; data will not persist"
         )
-    # SECURITY: Default JWT secret removed — Phase 0 hardening
-    # jwt_secret_key is now a required field (no default) so pydantic will
-    # raise ValidationError at startup if JWT_SECRET_KEY is not set.
+    if not settings.jwt_secret_key:
+        warnings.append(
+            "JWT_SECRET_KEY not set – customer-token endpoint will reject requests. "
+            "Set JWT_SECRET_KEY in your environment."
+        )
     if not settings.anthropic_api_key and not settings.openai_api_key:
         warnings.append("Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY set – assistant will use keyword fallback only")
     # SECURITY: Webhook secret now required — Phase 0 hardening
