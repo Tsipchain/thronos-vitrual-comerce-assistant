@@ -17,6 +17,14 @@ class TenantContext(BaseModel):
     products_count: int = 0
     allowed_theme_keys: list[str] = []
     support_tier: str = "SELF_SERVICE"
+    # Full record lists, used by the admin assistant's tool-use (list_* tools
+    # and the system-prompt summaries). Optional / may be omitted by older
+    # callers, in which case the *_count fields above are used instead.
+    products: list[dict] = []
+    categories: list[dict] = []
+    shipping_options: list[dict] = []
+    payment_options: list[dict] = []
+    recent_orders: list[dict] = []
 
 
 class ConversationMessage(BaseModel):
@@ -39,7 +47,15 @@ class ProposedPatch(BaseModel):
     requires_password: bool = False
 
 
+class ProposedAction(BaseModel):
+    action: str  # e.g. "add_product", "update_product", "delete_product",
+                 # "add_category", "add_shipping_option", "update_store_setting"
+    params: dict
+    description: str
+
+
 class AdminChatResponse(BaseModel):
     response: str
-    proposed_patches: list[ProposedPatch] = []
+    proposed_patches: list[ProposedPatch] = []  # kept for backward compat
+    proposed_actions: list[ProposedAction] = []  # broader action types (products, categories, shipping, settings)
     intent: Optional[str] = None
